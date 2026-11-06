@@ -1,0 +1,22 @@
+[package]
+name = "client"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+shared = { path = "../shared" }
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+
+# egui's official app framework: creates the window and runs the render loop.
+eframe = "0.32"
+# Async runtime for networking, running on background threads.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+# HTTP client. rustls = pure-Rust TLS, so https works without OpenSSL.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# WebSocket client.
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+# `StreamExt::next()` for reading the WebSocket stream.
+futures-util = "0.3"

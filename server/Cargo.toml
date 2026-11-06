@@ -1,0 +1,29 @@
+[package]
+name = "server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+shared = { path = "../shared" }
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+
+# Async runtime: runs thousands of concurrent tasks (one per connection) on a few OS threads.
+tokio = { version = "1", features = ["full"] }
+# Web framework: routing, JSON extraction, and (later) WebSockets.
+axum = { version = "0.8", features = ["ws"] }
+# Async Postgres driver. `tls-rustls` = pure-Rust TLS, needed because Neon requires SSL.
+sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "migrate", "macros"] }
+# Password hashing (Argon2 is the current recommended algorithm).
+argon2 = "0.5"
+# Cryptographically secure random bytes for session tokens and salts.
+rand_core = { version = "0.6", features = ["getrandom"] }
+# Loads .env into environment variables.
+dotenvy = "0.15"
+# Ergonomic error type for "something unexpected went wrong".
+anyhow = "1"
+# Structured logging.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

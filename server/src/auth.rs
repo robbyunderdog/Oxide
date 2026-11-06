@@ -9,31 +9,46 @@ use axum::{
     http::{header::AUTHORIZATION, request::Parts},
 };
 use rand_core::{OsRng, RngCore};
-use shared::{AuthRequest, AuthResponse, User};
+use shared::{AuthResponse, LoginRequest, RegisterRequest, User};
 use uuid::Uuid;
 
 use crate::{AppState, error::AppError};
 
 // ---------- Handlers ----------
 
+/// X25519 public keys are always 32 bytes.
+const PUBLIC_KEY_LEN: usize = 32;
+/// 24-byte nonce + 32-byte encrypted key + 16-byte authentication tag.
+const KEY_BACKUP_LEN: usize = 24 + 32 + 16;
+
 pub async fn register(
     State(state): State<AppState>,
-    Json(req): Json<AuthRequest>,
+    Json(req): Json<RegisterRequest>,
 ) -> Result<Json<AuthResponse>, AppError> {
     validate_username(&req.username)?;
-    if req.password.len() < 8 {
-        return Err(AppError::BadRequest("password must be at least 8 characters".into()));
+    validate_auth_key(&req.auth_key)?;
+    // We can't check the keys are *correct* (we can't decrypt them, by design),
+    // only that they have the right shape.
+    if req.public_key.len() != PUBLIC_KEY_LEN || req.encrypted_private_key.len() != KEY_BACKUP_LEN {
+        return Err(AppError::BadRequest("invalid key data".into()));
     }
 
-    let password_hash = hash_password(req.password).await?;
+    // The auth key is hashed *again* here. If the database leaked, the stored
+    // hash still couldn't be replayed to log in.
+    let password_hash = hash_password(req.auth_key).await?;
     let id = Uuid::new_v4();
 
-    let result = sqlx::query("INSERT INTO users (id, username, password_hash) VALUES ($1, $2, $3)")
-        .bind(id)
-        .bind(&req.username)
-        .bind(&password_hash)
-        .execute(&state.db)
-        .await;
+    let result = sqlx::query(
+        "INSERT INTO users (id, username, password_hash, public_key, encrypted_private_key)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(id)
+    .bind(&req.username)
+    .bind(&password_hash)
+    .bind(&req.public_key)
+    .bind(&req.encrypted_private_key)
+    .execute(&state.db)
+    .await;
 
     // Pattern matching on the error lets us turn one specific database
     // failure (duplicate username) into a friendly 409 response.
@@ -46,15 +61,21 @@ pub async fn register(
     }
 
     let token = create_session(&state, id).await?;
-    Ok(Json(AuthResponse { token, user: User { id, username: req.username } }))
+    Ok(Json(AuthResponse {
+        token,
+        user: User { id, username: req.username },
+        public_key: req.public_key,
+        encrypted_private_key: req.encrypted_private_key,
+    }))
 }
 
 pub async fn login(
     State(state): State<AppState>,
-    Json(req): Json<AuthRequest>,
+    Json(req): Json<LoginRequest>,
 ) -> Result<Json<AuthResponse>, AppError> {
-    let row: Option<(Uuid, String, String)> = sqlx::query_as(
-        "SELECT id, username, password_hash FROM users WHERE lower(username) = lower($1)",
+    let row: Option<(Uuid, String, String, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+        "SELECT id, username, password_hash, public_key, encrypted_private_key
+         FROM users WHERE lower(username) = lower($1)",
     )
     .bind(&req.username)
     .fetch_optional(&state.db)
@@ -64,15 +85,17 @@ pub async fn login(
     // so attackers can't probe which usernames exist.
     const BAD_LOGIN: &str = "invalid username or password";
 
-    let Some((id, username, password_hash)) = row else {
+    let Some((id, username, password_hash, public_key, encrypted_private_key)) = row else {
         return Err(AppError::Unauthorized(BAD_LOGIN));
     };
-    if !verify_password(req.password, password_hash).await? {
+    if !verify_password(req.auth_key, password_hash).await? {
         return Err(AppError::Unauthorized(BAD_LOGIN));
     }
 
+    // Hand back the locked key backup. Only the client, which knows the
+    // password, can unlock it.
     let token = create_session(&state, id).await?;
-    Ok(Json(AuthResponse { token, user: User { id, username } }))
+    Ok(Json(AuthResponse { token, user: User { id, username }, public_key, encrypted_private_key }))
 }
 
 /// `GET /me`. Simply declaring `AuthUser` as a parameter makes this route
@@ -128,6 +151,15 @@ fn validate_username(name: &str) -> Result<(), AppError> {
         Err(AppError::BadRequest(
             "username must be 3-32 characters: letters, digits, or _".into(),
         ))
+    }
+}
+
+/// The client sends a 32-byte key as 64 hex characters, never the password.
+fn validate_auth_key(key: &str) -> Result<(), AppError> {
+    if key.len() == 64 && key.chars().all(|c| c.is_ascii_hexdigit()) {
+        Ok(())
+    } else {
+        Err(AppError::BadRequest("malformed auth key (is your client up to date?)".into()))
     }
 }
 

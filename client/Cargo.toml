@@ -20,3 +20,19 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 # `StreamExt::next()` for reading the WebSocket stream.
 futures-util = "0.3"
+
+# ---- End-to-end encryption (all from the audited RustCrypto / dalek projects) ----
+# Password -> master key (memory-hard, resists GPU brute force).
+argon2 = "0.5"
+# Splits one master key into independent sub-keys.
+hkdf = "0.12"
+sha2 = "0.10"
+# Elliptic-curve Diffie-Hellman: two people derive the same secret from
+# (my private key, your public key) without ever sending it.
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+# Authenticated encryption: confidentiality + tamper detection.
+chacha20poly1305 = "0.10"
+# Secure randomness from the OS for keys and nonces.
+rand_core = { version = "0.6", features = ["getrandom"] }
+# Wipes key material from memory when it's dropped.
+zeroize = "1"

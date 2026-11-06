@@ -7,3 +7,5 @@ edition = "2024"
 serde.workspace = true
 uuid.workspace = true
 chrono.workspace = true
+# Encodes raw bytes (keys, ciphertext) as text so they can travel inside JSON.
+base64 = "0.22"

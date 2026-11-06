@@ -6,11 +6,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::Receiver;
 
 use eframe::egui::{self, Align2, Button, Color32, Key, RichText, ScrollArea, TextEdit, vec2};
-use shared::{Channel, DmChannel, Guild, Message, ServerEvent, User};
+use shared::{Channel, DmChannel, Guild, ServerEvent, User};
 use tokio::sync::mpsc::UnboundedSender;
 use uuid::Uuid;
 
-use crate::net::{Command, Event};
+use crate::crypto;
+use crate::net::{ChatMessage, Command, Event};
 
 /// What the left side is showing: your DMs, or one guild's channels.
 #[derive(Clone, Copy, PartialEq)]
@@ -25,6 +26,7 @@ pub struct App {
 
     // Session
     me: Option<User>,
+    my_public_key: Vec<u8>,
     busy: bool,
     error: Option<String>,
     connected: bool,
@@ -34,7 +36,7 @@ pub struct App {
     guilds: Vec<Guild>,
     channels: HashMap<Uuid, Vec<Channel>>, // guild id -> channels
     dms: Vec<DmChannel>,
-    messages: HashMap<Uuid, Vec<Message>>, // channel id -> messages
+    messages: HashMap<Uuid, Vec<ChatMessage>>, // channel id -> decrypted messages
     unread: HashSet<Uuid>,                 // channel ids with unseen messages
 
     // Navigation
@@ -58,6 +60,7 @@ impl App {
             cmd,
             events,
             me: None,
+            my_public_key: Vec::new(),
             busy: false,
             error: None,
             connected: false,
@@ -90,8 +93,9 @@ impl App {
     fn process_events(&mut self) {
         while let Ok(event) = self.events.try_recv() {
             match event {
-                Event::LoggedIn(auth) => {
-                    self.me = Some(auth.user);
+                Event::LoggedIn { user, public_key } => {
+                    self.me = Some(user);
+                    self.my_public_key = public_key;
                     self.busy = false;
                     self.error = None;
                     self.password.clear();
@@ -134,6 +138,7 @@ impl App {
                     self.view = View::Home;
                     self.select_channel(id);
                 }
+                Event::MessageReceived(message) => self.add_message(message),
                 Event::Server(event) => self.apply_server_event(event),
                 Event::Connection(up) => {
                     // After a reconnect we may have missed messages: drop the
@@ -155,22 +160,25 @@ impl App {
         }
     }
 
+    fn add_message(&mut self, message: ChatMessage) {
+        let mine = self.me.as_ref().is_some_and(|me| me.id == message.author.id);
+        if Some(message.channel_id) != self.selected_channel && !mine {
+            self.unread.insert(message.channel_id);
+        }
+        // Only append if we've loaded this channel; otherwise it'll come with
+        // the history when opened. Dedupe by id because the same message can
+        // arrive via both HTTP and WebSocket.
+        if let Some(list) = self.messages.get_mut(&message.channel_id) {
+            if !list.iter().any(|m| m.id == message.id) {
+                list.push(message);
+            }
+        }
+    }
+
     fn apply_server_event(&mut self, event: ServerEvent) {
         match event {
-            ServerEvent::MessageCreated { message } => {
-                let mine = self.me.as_ref().is_some_and(|me| me.id == message.author.id);
-                if Some(message.channel_id) != self.selected_channel && !mine {
-                    self.unread.insert(message.channel_id);
-                }
-                // Only append if we've loaded this channel; otherwise it'll
-                // come with the history when opened. Dedupe by id because the
-                // same message can arrive via both HTTP and WebSocket.
-                if let Some(list) = self.messages.get_mut(&message.channel_id) {
-                    if !list.iter().any(|m| m.id == message.id) {
-                        list.push(message);
-                    }
-                }
-            }
+            // net.rs decrypts these and sends `Event::MessageReceived` instead.
+            ServerEvent::MessageCreated { .. } => {}
             ServerEvent::ChannelCreated { channel } => {
                 if let Some(list) = channel.guild_id.and_then(|g| self.channels.get_mut(&g)) {
                     if !list.iter().any(|c| c.id == channel.id) {
@@ -269,6 +277,12 @@ impl App {
     fn auth(&mut self, register: bool) {
         if self.username.trim().is_empty() || self.password.is_empty() {
             self.error = Some("enter a username and password".into());
+            return;
+        }
+        // The server never sees the password any more, so this check has to
+        // live here.
+        if register && self.password.chars().count() < 8 {
+            self.error = Some("password must be at least 8 characters".into());
             return;
         }
         self.busy = true;
@@ -475,6 +489,17 @@ impl App {
                 return;
             };
             ui.heading(title.unwrap_or_default());
+            if let Some(dm) = self.dms.iter().find(|d| d.channel.id == channel_id) {
+                let number = crypto::safety_number(&self.my_public_key, &dm.other_public_key);
+                ui.horizontal(|ui| {
+                    ui.colored_label(Color32::from_rgb(67, 181, 129), "End-to-end encrypted");
+                    ui.weak(format!("· safety number {number}")).on_hover_text(format!(
+                        "Compare this number with {} (in person or over a call). If it matches on both \
+                         screens, nobody, not even the server, can read or intercept this conversation.",
+                        dm.other_user.username
+                    ));
+                });
+            }
             ui.separator();
 
             let Some(messages) = self.messages.get(&channel_id) else {
@@ -489,7 +514,7 @@ impl App {
                     if messages.is_empty() {
                         ui.weak("No messages yet. Say hi!");
                     }
-                    let mut prev: Option<&Message> = None;
+                    let mut prev: Option<&ChatMessage> = None;
                     for m in messages {
                         // Like Discord: consecutive messages from the same person
                         // within 5 minutes share one name header.
@@ -505,7 +530,18 @@ impl App {
                                 );
                             });
                         }
-                        ui.label(&m.content);
+                        match &m.text {
+                            Some(text) => {
+                                ui.label(text);
+                            }
+                            None => {
+                                ui.label(
+                                    RichText::new("Couldn't decrypt this message")
+                                        .italics()
+                                        .color(ui.visuals().error_fg_color),
+                                );
+                            }
+                        }
                         prev = Some(m);
                     }
                 });

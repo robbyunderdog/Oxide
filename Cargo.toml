@@ -11,3 +11,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
+
+# Compile *dependencies* with optimizations even in debug builds. Argon2 is
+# intentionally expensive and is ~10x slower unoptimized; egui benefits too.
+# Our own code stays unoptimized so it still compiles quickly.
+[profile.dev.package."*"]
+opt-level = 2

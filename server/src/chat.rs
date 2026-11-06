@@ -1,5 +1,6 @@
 //! Messages: history, sending, and channel access control.
-//! Works identically for guild channels and DM channels.
+//! Works identically for guild channels and DM channels, except that DM
+//! messages must arrive end-to-end encrypted.
 
 use axum::{
     Json,
@@ -7,18 +8,26 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
-use shared::{Message, SendMessageRequest, ServerEvent, User};
+use shared::{Message, MessageBody, SendMessageRequest, ServerEvent, User};
 use uuid::Uuid;
 
 use crate::{AppState, auth::AuthUser, error::AppError};
 
-/// `#[derive(FromRow)]` maps result columns to fields *by name*, which is
-/// clearer than a 6-element tuple. We then convert into the shared type.
+/// Longest plaintext message, in characters.
+const MAX_CHARS: usize = 2000;
+/// XChaCha20-Poly1305 nonce size.
+const NONCE_LEN: usize = 24;
+/// Upper bound for ciphertext: 2000 chars * up to 4 bytes (UTF-8) + 16-byte tag.
+const MAX_CIPHERTEXT: usize = MAX_CHARS * 4 + 16;
+
+/// `#[derive(FromRow)]` maps result columns to fields *by name*.
 #[derive(sqlx::FromRow)]
 struct MessageRow {
     id: Uuid,
     channel_id: Uuid,
-    content: String,
+    content: Option<String>,
+    nonce: Option<Vec<u8>>,
+    ciphertext: Option<Vec<u8>>,
     created_at: DateTime<Utc>,
     author_id: Uuid,
     author_name: String,
@@ -26,11 +35,19 @@ struct MessageRow {
 
 impl From<MessageRow> for Message {
     fn from(r: MessageRow) -> Self {
+        // The database CHECK constraint guarantees exactly one of these shapes.
+        let body = match (r.content, r.nonce, r.ciphertext) {
+            (Some(content), _, _) => MessageBody::Plain { content },
+            (None, nonce, ciphertext) => MessageBody::Encrypted {
+                nonce: nonce.unwrap_or_default(),
+                ciphertext: ciphertext.unwrap_or_default(),
+            },
+        };
         Message {
             id: r.id,
             channel_id: r.channel_id,
             author: User { id: r.author_id, username: r.author_name },
-            content: r.content,
+            body,
             created_at: r.created_at,
         }
     }
@@ -52,7 +69,7 @@ pub async fn history(
     require_access(&state.db, channel_id, user.id).await?;
 
     let mut rows: Vec<MessageRow> = sqlx::query_as(
-        "SELECT m.id, m.channel_id, m.content, m.created_at,
+        "SELECT m.id, m.channel_id, m.content, m.nonce, m.ciphertext, m.created_at,
                 u.id AS author_id, u.username AS author_name
          FROM messages m JOIN users u ON u.id = m.author_id
          WHERE m.channel_id = $1 AND ($2::timestamptz IS NULL OR m.created_at < $2)
@@ -76,32 +93,69 @@ pub async fn send(
     Path(channel_id): Path<Uuid>,
     Json(req): Json<SendMessageRequest>,
 ) -> Result<Json<Message>, AppError> {
-    let content = req.content.trim();
-    if content.is_empty() {
-        return Err(AppError::BadRequest("message can't be empty".into()));
-    }
-    if content.chars().count() > 2000 {
-        return Err(AppError::BadRequest("message can be at most 2000 characters".into()));
-    }
     require_access(&state.db, channel_id, user.id).await?;
 
-    let message = Message {
-        id: Uuid::new_v4(),
-        channel_id,
-        author: user, // `user` is *moved* into the message; we don't need it after this
-        content: content.to_string(),
-        created_at: Utc::now(),
+    let is_dm: bool = sqlx::query_scalar("SELECT guild_id IS NULL FROM channels WHERE id = $1")
+        .bind(channel_id)
+        .fetch_one(&state.db)
+        .await?;
+
+    // Matching on (body kind, channel kind) makes every combination explicit,
+    // and the compiler checks we've covered all four.
+    let body = match (req.body, is_dm) {
+        (MessageBody::Plain { content }, false) => {
+            let content = content.trim().to_string();
+            if content.is_empty() {
+                return Err(AppError::BadRequest("message can't be empty".into()));
+            }
+            if content.chars().count() > MAX_CHARS {
+                return Err(AppError::BadRequest(format!("message can be at most {MAX_CHARS} characters")));
+            }
+            MessageBody::Plain { content }
+        }
+        (MessageBody::Encrypted { nonce, ciphertext }, true) => {
+            // We can't read it; we can only check its shape and size.
+            if nonce.len() != NONCE_LEN || ciphertext.len() <= 16 || ciphertext.len() > MAX_CIPHERTEXT {
+                return Err(AppError::BadRequest("malformed encrypted message".into()));
+            }
+            MessageBody::Encrypted { nonce, ciphertext }
+        }
+        (MessageBody::Plain { .. }, true) => {
+            return Err(AppError::BadRequest("direct messages must be end-to-end encrypted".into()));
+        }
+        (MessageBody::Encrypted { .. }, false) => {
+            return Err(AppError::BadRequest("server channels don't support encryption yet".into()));
+        }
     };
-    sqlx::query(
-        "INSERT INTO messages (id, channel_id, author_id, content, created_at) VALUES ($1, $2, $3, $4, $5)",
+
+    let (content, nonce, ciphertext) = match &body {
+        MessageBody::Plain { content } => (Some(content.as_str()), None, None),
+        MessageBody::Encrypted { nonce, ciphertext } => (None, Some(nonce.as_slice()), Some(ciphertext.as_slice())),
+    };
+
+    let message = Message { id: req.id, channel_id, author: user, body: body.clone(), created_at: Utc::now() };
+    let result = sqlx::query(
+        "INSERT INTO messages (id, channel_id, author_id, content, nonce, ciphertext, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
     )
     .bind(message.id)
     .bind(channel_id)
     .bind(message.author.id)
-    .bind(&message.content)
+    .bind(content)
+    .bind(nonce)
+    .bind(ciphertext)
     .bind(message.created_at)
     .execute(&state.db)
-    .await?;
+    .await;
+
+    match result {
+        Ok(_) => {}
+        // The client picks message ids; reusing one is rejected.
+        Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
+            return Err(AppError::Conflict("duplicate message id".into()));
+        }
+        Err(e) => return Err(e.into()),
+    }
 
     let recipients = channel_members(&state.db, channel_id).await?;
     state.hub.send_to(&recipients, &ServerEvent::MessageCreated { message: message.clone() });

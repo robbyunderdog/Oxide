@@ -13,8 +13,8 @@ pub async fn list(
     AuthUser(me): AuthUser,
 ) -> Result<Json<Vec<DmChannel>>, AppError> {
     // Join dm_members twice: once for "me", once for "the other person".
-    let rows: Vec<(Uuid, Uuid, String)> = sqlx::query_as(
-        "SELECT c.id, u.id, u.username
+    let rows: Vec<(Uuid, Uuid, String, Vec<u8>)> = sqlx::query_as(
+        "SELECT c.id, u.id, u.username, u.public_key
          FROM dm_members mine
          JOIN channels c ON c.id = mine.channel_id
          JOIN dm_members theirs ON theirs.channel_id = c.id AND theirs.user_id <> mine.user_id
@@ -26,7 +26,11 @@ pub async fn list(
     .fetch_all(&state.db)
     .await?;
 
-    Ok(Json(rows.into_iter().map(|(cid, uid, uname)| dm_view(cid, User { id: uid, username: uname })).collect()))
+    Ok(Json(
+        rows.into_iter()
+            .map(|(cid, uid, uname, pk)| dm_view(cid, User { id: uid, username: uname }, pk))
+            .collect(),
+    ))
 }
 
 /// `POST /dms`: open (or re-open) a DM with a user by username.
@@ -35,12 +39,12 @@ pub async fn open(
     AuthUser(me): AuthUser,
     Json(req): Json<OpenDmRequest>,
 ) -> Result<Json<DmChannel>, AppError> {
-    let other: Option<(Uuid, String)> =
-        sqlx::query_as("SELECT id, username FROM users WHERE lower(username) = lower($1)")
+    let other: Option<(Uuid, String, Vec<u8>)> =
+        sqlx::query_as("SELECT id, username, public_key FROM users WHERE lower(username) = lower($1)")
             .bind(req.username.trim())
             .fetch_optional(&state.db)
             .await?;
-    let (other_id, other_name) = other.ok_or(AppError::NotFound("no user with that username"))?;
+    let (other_id, other_name, other_pk) = other.ok_or(AppError::NotFound("no user with that username"))?;
     if other_id == me.id {
         return Err(AppError::BadRequest("you can't DM yourself".into()));
     }
@@ -82,17 +86,23 @@ pub async fn open(
 
     // If it's brand new, make it pop up in the other person's DM list live.
     if created.is_some() {
-        state.hub.send_to(&[other_id], &ServerEvent::DmCreated { dm: dm_view(channel_id, me.clone()) });
+        // The other person needs *my* public key to decrypt what I send.
+        let my_pk: Vec<u8> = sqlx::query_scalar("SELECT public_key FROM users WHERE id = $1")
+            .bind(me.id)
+            .fetch_one(&state.db)
+            .await?;
+        state.hub.send_to(&[other_id], &ServerEvent::DmCreated { dm: dm_view(channel_id, me.clone(), my_pk) });
     }
 
-    Ok(Json(dm_view(channel_id, User { id: other_id, username: other_name })))
+    Ok(Json(dm_view(channel_id, User { id: other_id, username: other_name }, other_pk)))
 }
 
 /// Builds the viewer-specific DM representation. The channel's display name
 /// is the other person's username.
-fn dm_view(channel_id: Uuid, other_user: User) -> DmChannel {
+fn dm_view(channel_id: Uuid, other_user: User, other_public_key: Vec<u8>) -> DmChannel {
     DmChannel {
         channel: Channel { id: channel_id, guild_id: None, name: other_user.username.clone() },
         other_user,
+        other_public_key,
     }
 }

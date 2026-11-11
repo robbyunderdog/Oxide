@@ -6,13 +6,14 @@ use argon2::{
 use axum::{
     Json,
     extract::{FromRequestParts, State},
-    http::{header::AUTHORIZATION, request::Parts},
+    http::{HeaderMap, header::AUTHORIZATION, request::Parts},
 };
 use rand_core::{OsRng, RngCore};
+use sha2::{Digest, Sha256};
 use shared::{AuthResponse, LoginRequest, RegisterRequest, User};
 use uuid::Uuid;
 
-use crate::{AppState, error::AppError};
+use crate::{AppState, error::AppError, limits::ClientIp};
 
 // ---------- Handlers ----------
 
@@ -20,11 +21,15 @@ use crate::{AppState, error::AppError};
 const PUBLIC_KEY_LEN: usize = 32;
 /// 24-byte nonce + 32-byte encrypted key + 16-byte authentication tag.
 const KEY_BACKUP_LEN: usize = 24 + 32 + 16;
+/// Logins last this long; after that the token stops working.
+const SESSION_DAYS: i32 = 30;
 
 pub async fn register(
     State(state): State<AppState>,
+    ClientIp(ip): ClientIp,
     Json(req): Json<RegisterRequest>,
 ) -> Result<Json<AuthResponse>, AppError> {
+    state.auth_limiter.check(ip)?;
     validate_username(&req.username)?;
     validate_auth_key(&req.auth_key)?;
     // We can't check the keys are *correct* (we can't decrypt them, by design),
@@ -35,7 +40,7 @@ pub async fn register(
 
     // The auth key is hashed *again* here. If the database leaked, the stored
     // hash still couldn't be replayed to log in.
-    let password_hash = hash_password(req.auth_key).await?;
+    let password_hash = hash_password(&state, req.auth_key).await?;
     let id = Uuid::new_v4();
 
     let result = sqlx::query(
@@ -71,8 +76,11 @@ pub async fn register(
 
 pub async fn login(
     State(state): State<AppState>,
+    ClientIp(ip): ClientIp,
     Json(req): Json<LoginRequest>,
 ) -> Result<Json<AuthResponse>, AppError> {
+    // Checked before any database or Argon2 work, so blocked requests are cheap.
+    state.auth_limiter.check(ip)?;
     let row: Option<(Uuid, String, String, Vec<u8>, Vec<u8>)> = sqlx::query_as(
         "SELECT id, username, password_hash, public_key, encrypted_private_key
          FROM users WHERE lower(username) = lower($1)",
@@ -88,7 +96,7 @@ pub async fn login(
     let Some((id, username, password_hash, public_key, encrypted_private_key)) = row else {
         return Err(AppError::Unauthorized(BAD_LOGIN));
     };
-    if !verify_password(req.auth_key, password_hash).await? {
+    if !verify_password(&state, req.auth_key, password_hash).await? {
         return Err(AppError::Unauthorized(BAD_LOGIN));
     }
 
@@ -96,6 +104,17 @@ pub async fn login(
     // password, can unlock it.
     let token = create_session(&state, id).await?;
     Ok(Json(AuthResponse { token, user: User { id, username }, public_key, encrypted_private_key }))
+}
+
+/// `POST /auth/logout`: deletes this device's session on the server, so the
+/// token is useless even if it was copied somewhere.
+pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<()>, AppError> {
+    let token = bearer_token(&headers)?;
+    sqlx::query("DELETE FROM sessions WHERE token_hash = $1")
+        .bind(hash_token(token))
+        .execute(&state.db)
+        .await?;
+    Ok(Json(()))
 }
 
 /// `GET /me`. Simply declaring `AuthUser` as a parameter makes this route
@@ -114,13 +133,7 @@ impl FromRequestParts<AppState> for AuthUser {
     type Rejection = AppError;
 
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, AppError> {
-        let token = parts
-            .headers
-            .get(AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .ok_or(AppError::Unauthorized("missing bearer token"))?;
-
+        let token = bearer_token(&parts.headers)?;
         let user = user_for_token(&state.db, token)
             .await?
             .ok_or(AppError::Unauthorized("invalid or expired token"))?;
@@ -128,13 +141,21 @@ impl FromRequestParts<AppState> for AuthUser {
     }
 }
 
-/// Looks up which user a session token belongs to. Public so the WebSocket
-/// handler can reuse it later.
+fn bearer_token(headers: &HeaderMap) -> Result<&str, AppError> {
+    headers
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or(AppError::Unauthorized("missing bearer token"))
+}
+
+/// Looks up which user a session token belongs to (if it hasn't expired).
 pub async fn user_for_token(db: &sqlx::PgPool, token: &str) -> Result<Option<User>, sqlx::Error> {
     let row: Option<(Uuid, String)> = sqlx::query_as(
-        "SELECT u.id, u.username FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = $1",
+        "SELECT u.id, u.username FROM sessions s JOIN users u ON u.id = s.user_id
+         WHERE s.token_hash = $1 AND s.expires_at > now()",
     )
-    .bind(token)
+    .bind(hash_token(token))
     .fetch_optional(db)
     .await?;
     Ok(row.map(|(id, username)| User { id, username }))
@@ -166,7 +187,9 @@ fn validate_auth_key(key: &str) -> Result<(), AppError> {
 /// Argon2 is deliberately slow (that's what makes brute-forcing expensive).
 /// Running it directly in an async handler would block a tokio worker thread
 /// and stall other connections, so we move it to a dedicated blocking thread.
-async fn hash_password(password: String) -> Result<String, AppError> {
+async fn hash_password(state: &AppState, password: String) -> Result<String, AppError> {
+    // Wait for a free slot; `_slot` holds it until the end of this function.
+    let _slot = state.hash_slots.acquire().await?;
     let hash = tokio::task::spawn_blocking(move || {
         let salt = SaltString::generate(&mut OsRng);
         Argon2::default()
@@ -178,7 +201,8 @@ async fn hash_password(password: String) -> Result<String, AppError> {
     Ok(hash)
 }
 
-async fn verify_password(password: String, stored_hash: String) -> Result<bool, AppError> {
+async fn verify_password(state: &AppState, password: String, stored_hash: String) -> Result<bool, AppError> {
+    let _slot = state.hash_slots.acquire().await?;
     let ok = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
         let parsed = PasswordHash::new(&stored_hash)
             .map_err(|e| anyhow::anyhow!("stored hash is malformed: {e}"))?;
@@ -195,14 +219,32 @@ pub fn random_hex(n_bytes: usize) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Session tokens are stored *hashed*, like passwords. The client holds the
+/// real token; the database only holds SHA-256 of it. Someone who can read
+/// the database (a leaked backup, the hosting company) sees hashes they can't
+/// turn back into working tokens.
+///
+/// Why SHA-256 and not slow Argon2 like passwords? Argon2's slowness protects
+/// *guessable* secrets. A token is 256 random bits, impossible to guess, so a
+/// fast hash is just as safe and doesn't slow down every request.
+fn hash_token(token: &str) -> Vec<u8> {
+    Sha256::digest(token.as_bytes()).to_vec()
+}
+
 /// 32 random bytes = 256 bits: an unguessable session token.
 async fn create_session(state: &AppState, user_id: Uuid) -> Result<String, AppError> {
     let token = random_hex(32);
 
-    sqlx::query("INSERT INTO sessions (token, user_id) VALUES ($1, $2)")
-        .bind(&token)
-        .bind(user_id)
-        .execute(&state.db)
-        .await?;
+    // Housekeeping: drop expired sessions so the table doesn't grow forever.
+    sqlx::query("DELETE FROM sessions WHERE expires_at <= now()").execute(&state.db).await?;
+    sqlx::query(
+        "INSERT INTO sessions (token_hash, user_id, expires_at)
+         VALUES ($1, $2, now() + make_interval(days => $3))",
+    )
+    .bind(hash_token(&token))
+    .bind(user_id)
+    .bind(SESSION_DAYS)
+    .execute(&state.db)
+    .await?;
     Ok(token)
 }

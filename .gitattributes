@@ -1,3 +1,3 @@
-# sqlx checksums migration files; line-ending conversion would change the
+# Sqlx checksums migration files; line-ending conversion would change the
 # checksum and make the server refuse to start. Always keep them LF.
 *.sql text eol=lf

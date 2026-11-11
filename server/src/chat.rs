@@ -17,8 +17,15 @@ use crate::{AppState, auth::AuthUser, error::AppError};
 const MAX_CHARS: usize = 2000;
 /// XChaCha20-Poly1305 nonce size.
 const NONCE_LEN: usize = 24;
-/// Upper bound for ciphertext: 2000 chars * up to 4 bytes (UTF-8) + 16-byte tag.
-const MAX_CIPHERTEXT: usize = MAX_CHARS * 4 + 16;
+/// Clients pad DM plaintext to a multiple of this many bytes so ciphertext
+/// length doesn't reveal message length. Must match `PAD_BLOCK` in the
+/// client's crypto.rs.
+const PAD_BLOCK: usize = 256;
+/// Poly1305 authentication tag appended to every ciphertext.
+const TAG_LEN: usize = 16;
+/// Upper bound for ciphertext: 2000 chars * up to 4 bytes (UTF-8), plus the
+/// padding marker byte, rounded up to whole blocks, plus the tag.
+const MAX_CIPHERTEXT: usize = (MAX_CHARS * 4 + 1).div_ceil(PAD_BLOCK) * PAD_BLOCK + TAG_LEN;
 
 /// `#[derive(FromRow)]` maps result columns to fields *by name*.
 #[derive(sqlx::FromRow)]
@@ -114,8 +121,11 @@ pub async fn send(
             MessageBody::Plain { content }
         }
         (MessageBody::Encrypted { nonce, ciphertext }, true) => {
-            // We can't read it; we can only check its shape and size.
-            if nonce.len() != NONCE_LEN || ciphertext.len() <= 16 || ciphertext.len() > MAX_CIPHERTEXT {
+            // We can't read it; we can only check its shape and size. Insisting
+            // on whole padding blocks catches a buggy client that would
+            // otherwise leak exact message lengths.
+            let padded = ciphertext.len() > TAG_LEN && (ciphertext.len() - TAG_LEN) % PAD_BLOCK == 0;
+            if nonce.len() != NONCE_LEN || !padded || ciphertext.len() > MAX_CIPHERTEXT {
                 return Err(AppError::BadRequest("malformed encrypted message".into()));
             }
             MessageBody::Encrypted { nonce, ciphertext }

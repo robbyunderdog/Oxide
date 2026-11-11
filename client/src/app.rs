@@ -6,12 +6,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::Receiver;
 
 use eframe::egui::{self, Align2, Button, Color32, Key, RichText, ScrollArea, TextEdit, vec2};
-use shared::{Channel, DmChannel, Guild, ServerEvent, User};
+use shared::{Channel, Guild, ServerEvent, User};
 use tokio::sync::mpsc::UnboundedSender;
 use uuid::Uuid;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::crypto;
-use crate::net::{ChatMessage, Command, Event};
+use crate::net::{ChatMessage, Command, Dm, Event};
 
 /// What the left side is showing: your DMs, or one guild's channels.
 #[derive(Clone, Copy, PartialEq)]
@@ -35,7 +36,7 @@ pub struct App {
     // Data received from the server (a local cache)
     guilds: Vec<Guild>,
     channels: HashMap<Uuid, Vec<Channel>>, // guild id -> channels
-    dms: Vec<DmChannel>,
+    dms: Vec<Dm>,
     messages: HashMap<Uuid, Vec<ChatMessage>>, // channel id -> decrypted messages
     unread: HashSet<Uuid>,                 // channel ids with unseen messages
 
@@ -45,7 +46,8 @@ pub struct App {
 
     // Text boxes. egui widgets edit a `&mut String` you own.
     username: String,
-    password: String,
+    /// Wiped from memory when cleared or dropped (see `Zeroizing`).
+    password: Zeroizing<String>,
     composer: String,
     new_guild_name: String,
     invite_code: String,
@@ -73,7 +75,10 @@ impl App {
             view: View::Home,
             selected_channel: None,
             username: String::new(),
-            password: String::new(),
+            // Reserve room up front: if a String outgrows its buffer it moves
+            // to a bigger one, and the old copy of the password would be
+            // left behind in freed memory without being wiped.
+            password: Zeroizing::new(String::with_capacity(256)),
             composer: String::new(),
             new_guild_name: String::new(),
             invite_code: String::new(),
@@ -98,9 +103,16 @@ impl App {
                     self.my_public_key = public_key;
                     self.busy = false;
                     self.error = None;
-                    self.password.clear();
+                    self.password.zeroize(); // overwrite with zeros, then clear
                     self.send(Command::LoadGuilds);
                     self.send(Command::LoadDms);
+                }
+                Event::LoggedOut => {
+                    // Start over from a blank App so no cached messages, DMs
+                    // or keys survive into the next login. `events` can't be
+                    // cloned, so we swap a dummy in to move the real one out.
+                    let events = std::mem::replace(&mut self.events, std::sync::mpsc::channel().1);
+                    *self = App::new(self.cmd.clone(), events);
                 }
                 Event::Guilds(guilds) => {
                     // Preload every guild's channel list so unread markers
@@ -132,8 +144,9 @@ impl App {
                     self.messages.insert(channel_id, messages);
                 }
                 Event::Dms(dms) => self.dms = dms,
+                Event::DmAdded(dm) => self.add_dm(dm),
                 Event::DmOpened(dm) => {
-                    let id = dm.channel.id;
+                    let id = dm.info.channel.id;
                     self.add_dm(dm);
                     self.view = View::Home;
                     self.select_channel(id);
@@ -186,12 +199,13 @@ impl App {
                     }
                 }
             }
-            ServerEvent::DmCreated { dm } => self.add_dm(dm),
+            // net.rs sets up encryption for these and sends `Event::DmAdded`.
+            ServerEvent::DmCreated { .. } => {}
         }
     }
 
-    fn add_dm(&mut self, dm: DmChannel) {
-        if !self.dms.iter().any(|d| d.channel.id == dm.channel.id) {
+    fn add_dm(&mut self, dm: Dm) {
+        if !self.dms.iter().any(|d| d.info.channel.id == dm.info.channel.id) {
             self.dms.push(dm);
         }
     }
@@ -225,8 +239,8 @@ impl App {
     }
 
     fn channel_title(&self, id: Uuid) -> String {
-        if let Some(dm) = self.dms.iter().find(|d| d.channel.id == id) {
-            return format!("@{}", dm.other_user.username);
+        if let Some(dm) = self.dms.iter().find(|d| d.info.channel.id == id) {
+            return format!("@{}", dm.info.other_user.username);
         }
         self.channels
             .values()
@@ -247,7 +261,7 @@ impl App {
 
                 ui.add(TextEdit::singleline(&mut self.username).hint_text("username").desired_width(240.0));
                 let pw = ui.add(
-                    TextEdit::singleline(&mut self.password)
+                    TextEdit::singleline(&mut *self.password)
                         .hint_text("password")
                         .password(true)
                         .desired_width(240.0),
@@ -279,17 +293,20 @@ impl App {
             self.error = Some("enter a username and password".into());
             return;
         }
-        // The server never sees the password any more, so this check has to
-        // live here.
-        if register && self.password.chars().count() < 8 {
-            self.error = Some("password must be at least 8 characters".into());
-            return;
+        // The server never sees the password, so it can't check strength:
+        // this check has to live here. Only on register, so existing users
+        // can still log in.
+        if register {
+            if let Some(problem) = crypto::password_problem(self.username.trim(), &self.password) {
+                self.error = Some(problem);
+                return;
+            }
         }
         self.busy = true;
         self.error = None;
         self.send(Command::Auth {
             username: self.username.trim().to_string(),
-            password: self.password.clone(),
+            password: Zeroizing::new(self.password.to_string()),
             register,
         });
     }
@@ -301,7 +318,7 @@ impl App {
             ui.vertical_centered(|ui| {
                 let size = vec2(52.0, 52.0);
 
-                let dm_unread = self.dms.iter().any(|d| self.unread.contains(&d.channel.id));
+                let dm_unread = self.dms.iter().any(|d| self.unread.contains(&d.info.channel.id));
                 let home = ui
                     .add(Button::new(with_dot("DMs", dm_unread)).min_size(size).selected(self.view == View::Home))
                     .on_hover_text("Direct messages");
@@ -357,6 +374,9 @@ impl App {
                     ui.painter().circle_filled(rect.center(), 4.0, color);
                     ui.colored_label(color, text);
                 });
+                if ui.small_button("Log out").clicked() {
+                    self.send(Command::Logout);
+                }
                 ui.add_space(6.0);
             });
 
@@ -387,8 +407,10 @@ impl App {
                 ui.weak("No conversations yet.\nType a username above.");
             }
             for dm in &self.dms {
-                let id = dm.channel.id;
-                let label = with_dot(&format!("@{}", dm.other_user.username), self.unread.contains(&id));
+                let id = dm.info.channel.id;
+                // A warning sign on conversations whose encryption failed.
+                let name = if dm.problem.is_some() { "⚠ @" } else { "@" };
+                let label = with_dot(&format!("{name}{}", dm.info.other_user.username), self.unread.contains(&id));
                 if ui.selectable_label(self.selected_channel == Some(id), label).clicked() {
                     clicked = Some(id);
                 }
@@ -452,7 +474,11 @@ impl App {
 
         // The composer is a bottom panel, added *before* the central panel so
         // egui reserves its space first.
-        if let (Some(channel_id), Some(title)) = (self.selected_channel, &title) {
+        // Fail closed: no text box at all for a DM whose encryption failed.
+        let blocked = self.selected_channel.is_some_and(|c| {
+            self.dms.iter().any(|d| d.info.channel.id == c && d.problem.is_some())
+        });
+        if let (Some(channel_id), Some(title), false) = (self.selected_channel, &title, blocked) {
             egui::TopBottomPanel::bottom("composer").show(ctx, |ui| {
                 ui.add_space(8.0);
                 let input = ui.add(
@@ -489,7 +515,9 @@ impl App {
                 return;
             };
             ui.heading(title.unwrap_or_default());
-            if let Some(dm) = self.dms.iter().find(|d| d.channel.id == channel_id) {
+            if let Some(Dm { problem: Some(problem), .. }) = self.dms.iter().find(|d| d.info.channel.id == channel_id) {
+                ui.colored_label(ui.visuals().error_fg_color, format!("⚠ Not encrypted. Sending is blocked. {problem}"));
+            } else if let Some(Dm { info: dm, .. }) = self.dms.iter().find(|d| d.info.channel.id == channel_id) {
                 let number = crypto::safety_number(&self.my_public_key, &dm.other_public_key);
                 ui.horizontal(|ui| {
                     ui.colored_label(Color32::from_rgb(67, 181, 129), "End-to-end encrypted");

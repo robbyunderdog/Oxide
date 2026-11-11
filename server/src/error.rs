@@ -17,6 +17,8 @@ pub enum AppError {
     Forbidden(&'static str),
     NotFound(&'static str),
     Conflict(String),
+    /// Rate limit hit (HTTP 429).
+    TooManyRequests(&'static str),
     /// Anything unexpected (database down, bug, ...). Details are logged
     /// server-side but never leaked to the client.
     Internal(anyhow::Error),
@@ -30,6 +32,7 @@ impl IntoResponse for AppError {
             AppError::Forbidden(m) => (StatusCode::FORBIDDEN, m.to_string()),
             AppError::NotFound(m) => (StatusCode::NOT_FOUND, m.to_string()),
             AppError::Conflict(m) => (StatusCode::CONFLICT, m),
+            AppError::TooManyRequests(m) => (StatusCode::TOO_MANY_REQUESTS, m.to_string()),
             AppError::Internal(e) => {
                 tracing::error!("internal error: {e:#}");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal server error".to_string())

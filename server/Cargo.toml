@@ -27,3 +27,5 @@ anyhow = "1"
 # Structured logging.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Hashes session tokens before they are stored (see auth.rs).
+sha2 = "0.10"

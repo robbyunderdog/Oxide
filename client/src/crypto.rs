@@ -9,7 +9,7 @@
 //! DM key + random nonce ─XChaCha20-Poly1305─▶ ciphertext (bound to channel/message/author)
 //! ```
 
-use argon2::Argon2;
+use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
     aead::{Aead, KeyInit, Payload},
@@ -29,10 +29,33 @@ type SecretKey = Zeroizing<[u8; 32]>;
 
 // ---------- Password-derived keys ----------
 
+/// Argon2id cost settings. The server holds each user's encrypted key backup,
+/// so whoever runs the server can try password guesses offline, as fast as
+/// their hardware allows. These numbers set the price of *every* guess.
+///
+/// `Argon2::default()` (19 MiB, 2 passes) is tuned for servers doing thousands
+/// of logins a second. We run it once per login on the user's own machine, so
+/// we can afford far more: 256 MiB of memory makes each guess expensive even on
+/// GPUs (they have lots of cores but little memory per core).
+///
+/// The settings are hard-coded in the client, never sent by the server, so a
+/// malicious server can't talk a client into weaker ones. To change them
+/// later: bump `KDF_VERSION` (which changes every key) and add a way for
+/// existing accounts to migrate.
+const KDF_VERSION: &str = "v2";
+const ARGON2_MEMORY_KIB: u32 = 256 * 1024;
+const ARGON2_PASSES: u32 = 3;
+const ARGON2_LANES: u32 = 1;
+
+/// Minimum score from zxcvbn's 0-4 scale. 3 = "safely unguessable: moderate
+/// protection from offline slow-hash scenario", which is exactly our threat.
+const MIN_PASSWORD_SCORE: u8 = 3;
+const MIN_PASSWORD_CHARS: usize = 10;
+
 pub struct PasswordKeys {
     /// Sent to the server as proof of the password (hex). Can't be reversed
-    /// into the wrap key.
-    pub auth_key: String,
+    /// into the wrap key. Wiped from memory when dropped.
+    pub auth_key: Zeroizing<String>,
     /// Never leaves this machine.
     wrap_key: SecretKey,
 }
@@ -42,9 +65,11 @@ pub struct PasswordKeys {
 pub fn derive_password_keys(username: &str, password: &str) -> Result<PasswordKeys, String> {
     // The salt makes identical passwords produce different keys for different
     // users. It must be known before login, so it's derived from the username.
-    let salt = format!("oxide-v1:{}", normalize(username));
+    let salt = format!("oxide-{KDF_VERSION}:{}", normalize(username));
+    let params = Params::new(ARGON2_MEMORY_KIB, ARGON2_PASSES, ARGON2_LANES, Some(32))
+        .map_err(|e| format!("bad Argon2 settings: {e}"))?;
     let mut master: SecretKey = Zeroizing::new([0u8; 32]);
-    Argon2::default()
+    Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
         .hash_password_into(password.as_bytes(), salt.as_bytes(), &mut master[..])
         .map_err(|e| format!("key derivation failed: {e}"))?;
 
@@ -53,10 +78,37 @@ pub fn derive_password_keys(username: &str, password: &str) -> Result<PasswordKe
     let hk = Hkdf::<Sha256>::new(None, &master[..]);
     let mut auth: SecretKey = Zeroizing::new([0u8; 32]);
     let mut wrap_key: SecretKey = Zeroizing::new([0u8; 32]);
-    hk.expand(b"oxide auth v1", &mut auth[..]).expect("32 bytes is a valid HKDF length");
-    hk.expand(b"oxide key-wrap v1", &mut wrap_key[..]).expect("32 bytes is a valid HKDF length");
+    hk.expand(format!("oxide auth {KDF_VERSION}").as_bytes(), &mut auth[..])
+        .expect("32 bytes is a valid HKDF length");
+    hk.expand(format!("oxide key-wrap {KDF_VERSION}").as_bytes(), &mut wrap_key[..])
+        .expect("32 bytes is a valid HKDF length");
 
-    Ok(PasswordKeys { auth_key: to_hex(&auth[..]), wrap_key })
+    Ok(PasswordKeys { auth_key: Zeroizing::new(to_hex(&auth[..])), wrap_key })
+}
+
+/// Returns why a new password is too weak, or `None` if it's acceptable.
+///
+/// Length alone is a poor rule: "Password123!" is 12 characters but is among
+/// the first things a cracker tries. zxcvbn estimates how many guesses a smart
+/// attacker (dictionaries, common patterns, keyboard walks, your username...)
+/// would need.
+pub fn password_problem(username: &str, password: &str) -> Option<String> {
+    if password.chars().count() < MIN_PASSWORD_CHARS {
+        return Some(format!("password must be at least {MIN_PASSWORD_CHARS} characters"));
+    }
+    let estimate = zxcvbn::zxcvbn(password, &[username]);
+    if u8::from(estimate.score()) >= MIN_PASSWORD_SCORE {
+        return None;
+    }
+    // zxcvbn explains *why* when it can ("This is a top-100 common password").
+    let hint = estimate
+        .feedback()
+        .and_then(|f| f.warning().map(|w| w.to_string()).or_else(|| f.suggestions().first().map(|s| s.to_string())))
+        .unwrap_or_else(|| "Add more words or characters.".into());
+    Some(format!(
+        "password is too easy to guess. {hint} Tip: a few random words, like \
+         \"tulip orbit canyon velvet\", is strong and easy to remember."
+    ))
 }
 
 // ---------- Identity key pair ----------
@@ -127,7 +179,8 @@ pub struct ConversationKey(SecretKey);
 impl ConversationKey {
     /// Returns (nonce, ciphertext).
     pub fn encrypt(&self, channel_id: Uuid, message_id: Uuid, author_id: Uuid, text: &str) -> (Vec<u8>, Vec<u8>) {
-        let (nonce, ciphertext) = seal(&self.0, text.as_bytes(), &message_aad(channel_id, message_id, author_id));
+        let padded = pad(text.as_bytes());
+        let (nonce, ciphertext) = seal(&self.0, &padded, &message_aad(channel_id, message_id, author_id));
         (nonce.to_vec(), ciphertext)
     }
 
@@ -139,8 +192,40 @@ impl ConversationKey {
         nonce: &[u8],
         ciphertext: &[u8],
     ) -> Result<String, String> {
-        let plain = open(&self.0, nonce, ciphertext, &message_aad(channel_id, message_id, author_id))?;
-        String::from_utf8(plain).map_err(|_| "decrypted message is not valid text".into())
+        let padded = open(&self.0, nonce, ciphertext, &message_aad(channel_id, message_id, author_id))?;
+        String::from_utf8(unpad(padded)?).map_err(|_| "decrypted message is not valid text".into())
+    }
+}
+
+// ---------- Padding ----------
+
+/// Encryption hides *what* you said but not *how much*: ciphertext is exactly
+/// as long as the plaintext (plus a 16-byte tag). "ok" vs. a long paragraph
+/// would be obvious to the server. Rounding every message up to a multiple of
+/// this size means the server only learns a rough size bucket.
+/// Must match `PAD_BLOCK` in the server's chat.rs.
+pub const PAD_BLOCK: usize = 256;
+
+/// ISO/IEC 7816-4 padding: append one 0x80 byte, then zeros up to the block
+/// size. The 0x80 marks where the real text ends, so it can be removed
+/// unambiguously even if the text itself ends in zero bytes.
+fn pad(text: &[u8]) -> Zeroizing<Vec<u8>> {
+    let padded_len = (text.len() + 1).div_ceil(PAD_BLOCK) * PAD_BLOCK;
+    let mut out = Zeroizing::new(Vec::with_capacity(padded_len));
+    out.extend_from_slice(text);
+    out.push(0x80);
+    out.resize(padded_len, 0);
+    out
+}
+
+fn unpad(mut padded: Vec<u8>) -> Result<Vec<u8>, String> {
+    // Walk back over the zeros; the first non-zero byte must be the 0x80 marker.
+    match padded.iter().rposition(|&b| b != 0) {
+        Some(end) if padded[end] == 0x80 => {
+            padded.truncate(end);
+            Ok(padded)
+        }
+        _ => Err("message padding is invalid".into()),
     }
 }
 
@@ -196,7 +281,8 @@ fn open(key: &[u8; 32], nonce: &[u8], ciphertext: &[u8], aad: &[u8]) -> Result<V
 /// means the server can't move a ciphertext into another chat, re-send it as
 /// a new message, or claim someone else wrote it: decryption would fail.
 fn message_aad(channel_id: Uuid, message_id: Uuid, author_id: Uuid) -> Vec<u8> {
-    [b"oxide dm-msg v1".as_slice(), channel_id.as_bytes(), message_id.as_bytes(), author_id.as_bytes()].concat()
+    // v2: plaintext is now padded (see `pad`).
+    [b"oxide dm-msg v2".as_slice(), channel_id.as_bytes(), message_id.as_bytes(), author_id.as_bytes()].concat()
 }
 
 fn backup_aad(username: &str) -> String {
@@ -228,7 +314,36 @@ mod tests {
         assert_eq!(a.auth_key, b.auth_key, "usernames are case-insensitive");
         assert_ne!(a.auth_key, wrong.auth_key);
         assert_ne!(a.auth_key, other_user.auth_key, "salt differs per user");
-        assert_ne!(a.auth_key, to_hex(&a.wrap_key[..]), "auth and wrap keys must differ");
+        assert_ne!(*a.auth_key, to_hex(&a.wrap_key[..]), "auth and wrap keys must differ");
+    }
+
+    #[test]
+    fn padding_hides_length_and_round_trips() {
+        let (alice, bob) = (Identity::generate(), Identity::generate());
+        let (channel, author) = (Uuid::new_v4(), Uuid::new_v4());
+        let key = alice.conversation_key(&bob.public, channel).unwrap();
+
+        let short = key.encrypt(channel, Uuid::new_v4(), author, "ok").1;
+        let long = key.encrypt(channel, Uuid::new_v4(), author, &"a".repeat(200)).1;
+        assert_eq!(short.len(), long.len(), "both fit in one block, so the server can't tell them apart");
+        assert_eq!(short.len(), PAD_BLOCK + 16);
+
+        // Edge cases: empty, exactly one block, text ending in a zero byte.
+        for text in ["", &"x".repeat(PAD_BLOCK), "ends with nul\0"] {
+            let id = Uuid::new_v4();
+            let (nonce, ct) = key.encrypt(channel, id, author, text);
+            assert_eq!((ct.len() - 16) % PAD_BLOCK, 0);
+            assert_eq!(key.decrypt(channel, id, author, &nonce, &ct).unwrap(), text);
+        }
+        assert!(unpad(vec![0u8; PAD_BLOCK]).is_err(), "no 0x80 marker -> rejected");
+    }
+
+    #[test]
+    fn weak_passwords_are_rejected() {
+        for weak in ["short", "password123", "Password123!", "aliceAlice123", "qwertyuiop"] {
+            assert!(password_problem("alice", weak).is_some(), "{weak:?} should be rejected");
+        }
+        assert!(password_problem("alice", "tulip orbit canyon velvet").is_none());
     }
 
     #[test]
